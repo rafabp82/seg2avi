@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""
+seg2avi.py - Conversor de vídeos FMV .SEG (Sega CD, container "FILM" + codec "SM") para AVI.
+
+Dependências: Python 3.8+ e numpy. O ffmpeg é opcional (só para --codec diferente de "raw").
+
+Uso:
+    python3 seg2avi.py JUPITER.SEG                    # -> JUPITER.avi (RGB24 sem compressão + PCM 16-bit)
+    python3 seg2avi.py JUPITER.SEG saida.avi --scale 3
+    python3 seg2avi.py JUPITER.SEG saida.avi --scale 3 --codec mpeg4   # arquivo pequeno (precisa de ffmpeg)
+    python3 seg2avi.py JUPITER.SEG --png-dir quadros/ --no-audio       # só exporta PNGs (precisa de Pillow)
+
+--------------------------------------------------------------------------------
+FORMATO (obtido por engenharia reversa; tudo big-endian)
+--------------------------------------------------------------------------------
+Container FILM (Sega):
+    "FILM", u32 tamanho_do_cabeçalho, u32 versão, u32 reservado
+    "FDSC", u32 len(=0x14), fourcc "SEGA", u32 altura, u32 largura
+    "STAB", u32 len, u32 timescale (600 ticks/s), u32 n_entradas,
+            n * { u32 offset, u32 tamanho, u32 info1, u32 info2 }
+    Os dados começam em tamanho_do_cabeçalho; "offset" é relativo a esse ponto.
+    info1 == 0xFFFFFFFF -> chunk de áudio (PCM 8-bit sinal/magnitude, mono, 16 kHz);
+    caso contrário é um quadro de vídeo: info1 = timestamp (ticks), info2 = duração (ticks).
+
+Quadro de vídeo ("SM", intra, tiles 8x8 estilo VDP do Mega Drive):
+    0x00 "SM"   0x02 u16 (0x0023)   0x04 u32 tamanho em nibbles   0x08 u16 W_tiles   0x0A u16 H_tiles
+    0x0C 4 paletas x 16 cores, palavras Mega Drive 0000BBB0GGG0RRR0 (128 bytes)
+    então, em sequência:
+      - mapa de paletas : 2 bits por tile (MSB primeiro, ordem linha a linha), arredondado p/ par de bytes
+      - u32 n2 + livro de códigos "A": n2 bytes = 256 vetores de 4 bytes (4x2 pixels, 2 bytes por linha)
+      - u32 n3 + livro de códigos "B": n3 bytes = 256 vetores de 2 bytes (2x2 pixels, 1 byte por linha)
+      - mapa de modos   : 2 bits por tile (mesmo formato do mapa de paletas)
+      - fluxo de dados dos tiles, em ordem linha a linha, consumindo conforme o modo do tile:
+            modo 1: 32 bytes  -> tile cru 8x8, 4 bpp (nibble alto = pixel da esquerda)
+            modo 2:  8 bytes  -> 8 índices no livro A, grade 2 colunas x 4 linhas de vetores 4x2
+            modo 3: 16 bytes  -> 16 índices no livro B, grade 4x4 de vetores 2x2
+            modo 0: (não aparece neste arquivo; tratado como tile vazio, consome 0 bytes)
+    Cada nibble de pixel indexa a paleta escolhida para aquele tile.
+"""
+import argparse
+import math
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+
+import numpy as np
+
+TILE_BYTES = {1: 32, 2: 8, 3: 16}
+
+
+# --------------------------------------------------------------------------- container FILM
+class Film:
+    def __init__(self, data):
+        if data[:4] != b"FILM":
+            raise ValueError("não é um arquivo FILM/SEG (assinatura 'FILM' ausente)")
+        self.data = data
+        self.hdr_len = struct.unpack(">I", data[4:8])[0]
+        pos = 16
+        self.fourcc = None
+        self.entries = []
+        self.timescale = 600
+        while pos < self.hdr_len:
+            tag = data[pos:pos + 4]
+            ln = struct.unpack(">I", data[pos + 4:pos + 8])[0]
+            if tag == b"FDSC":
+                self.fourcc = data[pos + 8:pos + 12]
+                self.height, self.width = struct.unpack(">II", data[pos + 12:pos + 20])
+            elif tag == b"STAB":
+                self.timescale, n = struct.unpack(">II", data[pos + 8:pos + 16])
+                for i in range(n):
+                    self.entries.append(struct.unpack(">4I", data[pos + 16 + 16 * i:pos + 32 + 16 * i]))
+            if ln < 8:
+                break
+            pos += ln
+        if not self.entries:
+            raise ValueError("tabela STAB não encontrada")
+        self.video = []   # (bytes, timestamp, duração)
+        self.audio = []
+        for off, size, i1, i2 in self.entries:
+            chunk = data[self.hdr_len + off:self.hdr_len + off + size]
+            if i1 == 0xFFFFFFFF:
+                self.audio.append(chunk)
+            else:
+                self.video.append((chunk, i1 & 0x7FFFFFFF, i2))
+
+
+# --------------------------------------------------------------------------- decodificador "SM"
+def _crumbs(buf, n):
+    """n valores de 2 bits, MSB primeiro."""
+    a = np.frombuffer(buf, np.uint8)
+    out = np.stack([(a >> 6) & 3, (a >> 4) & 3, (a >> 2) & 3, a & 3], axis=1).reshape(-1)
+    return out[:n]
+
+
+def _nibbles(a):
+    """array uint8 (..., N) -> (..., 2N) com nibble alto primeiro."""
+    return np.stack([a >> 4, a & 15], axis=-1).reshape(*a.shape[:-1], a.shape[-1] * 2)
+
+
+def decode_frame(f):
+    """Decodifica um quadro 'SM'. Retorna array RGB uint8 (H*8, W*8, 3)."""
+    if f[:2] != b"SM":
+        raise ValueError("quadro sem assinatura 'SM'")
+    W, H = struct.unpack(">HH", f[8:12])
+    n = W * H
+    # paletas (Mega Drive: 0000BBB0 GGG0RRR0)
+    words = np.frombuffer(f[12:12 + 128], ">u2").astype(np.int32).reshape(4, 16)
+    lut = np.stack([((words >> 1) & 7), ((words >> 5) & 7), ((words >> 9) & 7)], axis=-1)
+    lut = (lut * 255 // 7).astype(np.uint8)                        # (4,16,3)
+
+    pos = 12 + 128
+    msz = (((n * 2 + 7) // 8) + 1) & ~1                             # arredonda p/ número par de bytes
+    pal_map = _crumbs(f[pos:pos + msz], n); pos += msz
+    l2 = struct.unpack(">I", f[pos:pos + 4])[0]; pos += 4
+    cbA = np.frombuffer(f[pos:pos + l2], np.uint8).reshape(-1, 4); pos += l2
+    l3 = struct.unpack(">I", f[pos:pos + 4])[0]; pos += 4
+    cbB = np.frombuffer(f[pos:pos + l3], np.uint8).reshape(-1, 2); pos += l3
+    modes = _crumbs(f[pos:pos + msz], n); pos += msz
+    stream = np.frombuffer(f[pos:], np.uint8)
+
+    # vetores como blocos de pixels: A = 4x2 (h=2,w=4), B = 2x2
+    vA = _nibbles(cbA).reshape(-1, 2, 4)
+    vB = _nibbles(cbB).reshape(-1, 2, 2)
+
+    sizes = np.array([0, 32, 8, 16])[modes]
+    offs = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+    need = int(sizes.sum())
+    if need > len(stream):                                           # quadro truncado: completa com zeros
+        stream = np.concatenate([stream, np.zeros(need - len(stream), np.uint8)])
+
+    tiles = np.zeros((n, 8, 8), np.uint8)
+    t1 = np.where(modes == 1)[0]
+    if len(t1):
+        raw = stream[offs[t1][:, None] + np.arange(32)]
+        tiles[t1] = _nibbles(raw).reshape(-1, 8, 8)
+    t2 = np.where(modes == 2)[0]
+    if len(t2):
+        idx = stream[offs[t2][:, None] + np.arange(8)]               # (k,8)
+        v = vA[idx].reshape(-1, 4, 2, 2, 4)                          # (k, gy, gx, h, w)
+        tiles[t2] = v.transpose(0, 1, 3, 2, 4).reshape(-1, 8, 8)
+    t3 = np.where(modes == 3)[0]
+    if len(t3):
+        idx = stream[offs[t3][:, None] + np.arange(16)]              # (k,16)
+        v = vB[idx].reshape(-1, 4, 4, 2, 2)                          # (k, gy, gx, h, w)
+        tiles[t3] = v.transpose(0, 1, 3, 2, 4).reshape(-1, 8, 8)
+
+    rgb = lut[pal_map[:, None, None], tiles]                         # (n,8,8,3)
+    rgb = rgb.reshape(H, W, 8, 8, 3).transpose(0, 2, 1, 3, 4).reshape(H * 8, W * 8, 3)
+    return rgb
+
+
+def decode_audio(chunks):
+    """PCM 8-bit sinal/magnitude (bit 7 = positivo, como no chip RF5C164) -> int16."""
+    x = np.frombuffer(b"".join(chunks), np.uint8)
+    mag = (x & 0x7F).astype(np.int16)
+    return (np.where(x & 0x80, mag, -mag) * 256).astype("<i2")
+
+
+# --------------------------------------------------------------------------- escritor AVI
+def _ck(tag, payload):
+    pad = b"\0" if len(payload) & 1 else b""
+    return tag + struct.pack("<I", len(payload)) + payload + pad
+
+
+def _list(kind, payload):
+    return b"LIST" + struct.pack("<I", len(payload) + 4) + kind + payload
+
+
+def write_avi(path, frames, rate, scale, w, h, audio=None, audio_rate=16000):
+    """frames: iterável de arrays RGB (h,w,3); fps = rate/scale. Vídeo RGB24 sem compressão."""
+    row = (w * 3 + 3) & ~3
+    frame_size = row * h
+    n_frames = len(frames)
+    has_a = audio is not None and len(audio)
+    fps = rate / scale
+
+    # quantas amostras de áudio entram após cada quadro (intercalado)
+    a_chunks = []
+    if has_a:
+        pos = 0
+        for k in range(n_frames):
+            end = len(audio) if k == n_frames - 1 else int(round((k + 1) / fps * audio_rate))
+            end = min(end, len(audio))
+            a_chunks.append(audio[pos:end].tobytes())
+            pos = end
+
+    avih = struct.pack("<IIIIIIIIIIIIII", int(1e6 / fps), frame_size * int(fps + 1) + (audio_rate * 2 if has_a else 0),
+                       0, 0x10, n_frames, 0, 2 if has_a else 1, frame_size, w, h, 0, 0, 0, 0)
+    strl_v = _list(b"strl",
+                   _ck(b"strh", b"vids" + b"DIB " + struct.pack("<IHHIIIIIIIIhhhh", 0, 0, 0, 0, scale, rate, 0, n_frames,
+                                                                  frame_size, 0xFFFFFFFF, 0, 0, 0, w, h))
+                   + _ck(b"strf", struct.pack("<IiiHHIIiiII", 40, w, h, 1, 24, 0, frame_size, 0, 0, 0, 0)))
+    parts = [_ck(b"avih", avih), strl_v]
+    if has_a:
+        total = sum(len(c) for c in a_chunks) // 2
+        strl_a = _list(b"strl",
+                       _ck(b"strh", b"auds" + b"\0\0\0\0" + struct.pack("<IHHIIIIIIIIhhhh", 0, 0, 0, 0, 2, audio_rate * 2, 0, total,
+                                                         audio_rate * 2, 0xFFFFFFFF, 2, 0, 0, 0, 0))
+                       + _ck(b"strf", struct.pack("<HHIIHHH", 1, 1, audio_rate, audio_rate * 2, 2, 16, 0)))
+        parts.append(strl_a)
+    hdrl = _list(b"hdrl", b"".join(parts))
+
+    with open(path, "wb") as out:
+        out.write(b"RIFF\0\0\0\0AVI ")
+        out.write(hdrl)
+        movi_start = out.tell()
+        out.write(b"LIST\0\0\0\0movi")
+        index = []
+        base = movi_start + 8                                        # 'movi' (offset relativo a este ponto)
+        for k, fr in enumerate(frames):
+            dib = np.ascontiguousarray(fr[::-1, :, ::-1])            # de baixo p/ cima, BGR
+            if row != w * 3:
+                dib = np.concatenate([dib.reshape(h, w * 3), np.zeros((h, row - w * 3), np.uint8)], axis=1)
+            data = dib.tobytes()
+            index.append((b"00db", 0x10, out.tell() - base, len(data)))
+            out.write(_ck(b"00db", data))
+            if has_a and a_chunks[k]:
+                index.append((b"01wb", 0x10, out.tell() - base, len(a_chunks[k])))
+                out.write(_ck(b"01wb", a_chunks[k]))
+        end_movi = out.tell()
+        idx = b"".join(t + struct.pack("<III", fl, off, sz) for t, fl, off, sz in index)
+        out.write(_ck(b"idx1", idx))
+        end = out.tell()
+        out.seek(movi_start + 4); out.write(struct.pack("<I", end_movi - movi_start - 4))
+        out.seek(4); out.write(struct.pack("<I", end - 8))
+
+
+# --------------------------------------------------------------------------- principal
+def main():
+    ap = argparse.ArgumentParser(description="Converte vídeos FMV .SEG do Sega CD para AVI.")
+    ap.add_argument("entrada")
+    ap.add_argument("saida", nargs="?")
+    ap.add_argument("--scale", type=int, default=1, help="ampliação inteira (vizinho mais próximo), padrão 1")
+    ap.add_argument("--codec", default="raw", help="'raw' (AVI sem compressão, sem ffmpeg) ou um codec do ffmpeg "
+                                                   "(mpeg4, libx264, ffv1, huffyuv, ...)")
+    ap.add_argument("--audio-rate", type=int, default=16000, help="taxa do áudio em Hz (padrão 16000)")
+    ap.add_argument("--no-audio", action="store_true")
+    ap.add_argument("--png-dir", help="também salva cada quadro como PNG nesta pasta (precisa de Pillow)")
+    ap.add_argument("--ffmpeg-args", default="", help="argumentos extras para o ffmpeg, ex.: '-q:v 2'")
+    a = ap.parse_args()
+
+    film = Film(open(a.entrada, "rb").read())
+    out_path = a.saida or os.path.splitext(a.entrada)[0] + ".avi"
+    if not film.video:
+        sys.exit("nenhum quadro de vídeo encontrado")
+
+    # taxa de quadros constante: mdc das durações (quadros longos são repetidos)
+    g = 0
+    for _, _, dur in film.video:
+        g = math.gcd(g, dur)
+    g = g or 1
+    print(f"{len(film.video)} quadros, {len(film.audio)} chunks de áudio, "
+          f"{film.timescale / g:g} fps (base), fourcc={film.fourcc!r}")
+
+    decoded, seq = [], []
+    for chunk, ts, dur in film.video:
+        rgb = decode_frame(chunk)
+        if a.scale > 1:
+            rgb = rgb.repeat(a.scale, 0).repeat(a.scale, 1)
+        for _ in range(max(1, dur // g)):
+            seq.append(rgb)
+        decoded.append(rgb)
+    h, w = seq[0].shape[:2]
+    audio = None if a.no_audio or not film.audio else decode_audio(film.audio)
+
+    if a.png_dir:
+        from PIL import Image
+        os.makedirs(a.png_dir, exist_ok=True)
+        for i, fr in enumerate(decoded):
+            Image.fromarray(fr).save(os.path.join(a.png_dir, f"frame_{i:05d}.png"))
+
+    if a.codec == "raw":
+        write_avi(out_path, seq, film.timescale, g, w, h, audio, a.audio_rate)
+    else:
+        ff = shutil.which("ffmpeg")
+        if not ff:
+            sys.exit("ffmpeg não encontrado; use --codec raw")
+        with tempfile.TemporaryDirectory() as tmp:
+            cmd = [ff, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
+                   "-r", f"{film.timescale}/{g}", "-i", "-"]
+            if audio is not None:
+                import wave
+                wav = os.path.join(tmp, "a.wav")
+                with wave.open(wav, "wb") as wf:
+                    wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(a.audio_rate)
+                    wf.writeframes(audio.tobytes())
+                cmd += ["-i", wav, "-c:a", "pcm_s16le"]
+            cmd += ["-c:v", a.codec, "-pix_fmt", "yuv420p" if a.codec not in ("ffv1", "huffyuv") else "rgb24"]
+            cmd += a.ffmpeg_args.split() + [out_path]
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+            for fr in seq:
+                p.stdin.write(fr.tobytes())
+            p.stdin.close()
+            if p.wait():
+                sys.exit("ffmpeg falhou")
+    print("gravado:", out_path)
+
+
+if __name__ == "__main__":
+    main()
